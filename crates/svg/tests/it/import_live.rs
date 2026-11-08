@@ -20,6 +20,75 @@ fn open(body: &str) -> (Document, Vec<String>) {
     import_with_report(&svg(body)).unwrap()
 }
 
+#[test]
+fn decoded_id_selectors_do_not_recolor_bare_ellipses() {
+    for selector in ["circle&#91;id]", "ellipse&#x5b;id]", "circle[id]", "ellipse[id]", "circle[ id ]", r"ellipse[\69 d]"] {
+        let source = svg(&format!(
+            "<style>{selector} {{ fill: red }}</style><circle cx=\"40\" cy=\"50\" r=\"20\"/><ellipse cx=\"100\" cy=\"50\" rx=\"20\" ry=\"10\"/><circle id=\"c\" cx=\"40\" cy=\"100\" r=\"8\"/><ellipse id=\"e\" cx=\"100\" cy=\"100\" rx=\"12\" ry=\"8\"/>"
+        ));
+        let doc = import(&source).unwrap();
+        let actual = render_artboard(&doc);
+        let expected = resvg_render(&source, 200, 120);
+        assert_eq!((actual.width, actual.height), (expected.width, expected.height));
+        for (x, y) in [(40, 50), (100, 50), (40, 100), (100, 100)] {
+            let at = 4 * (y * actual.width + x) as usize;
+            assert_eq!(&actual.rgba[at..at + 4], &expected.rgba[at..at + 4], "{selector}: ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn metadata_ids_preserve_attribute_selector_colors_and_metadata() {
+    for attrs in [r#"data-foo="kept""#, r#"xmlns:meta="https://example.org/metadata" meta:key="kept""#, r#"onclick="kept""#] {
+        let source = svg(&format!(
+            r#"<style>circle[id], ellipse[id] {{ fill:red }}</style><circle {attrs} cx="40" cy="50" r="20"/><ellipse {attrs} cx="100" cy="50" rx="20" ry="10"/>"#
+        ));
+        let doc = import(&source).unwrap();
+        let actual = render_artboard(&doc);
+        let expected = resvg_render(&source, 200, 120);
+        for (x, y) in [(40, 50), (100, 50)] {
+            let at = 4 * (y * actual.width + x) as usize;
+            assert_eq!(&actual.rgba[at..at + 4], &expected.rgba[at..at + 4], "{attrs}: ({x}, {y})");
+        }
+        let has_metadata = |doc: &Document| {
+            art(doc)
+                .into_iter()
+                .filter(|n| {
+                    n.extras().attrs.as_deref().is_some_and(|a| {
+                        a.data.iter().any(|(k, v)| k == "foo" && v == "kept")
+                            || a.foreign.iter().any(|a| a.ns == "https://example.org/metadata" && a.name == "key" && a.value == "kept")
+                            || a.events.iter().any(|(k, v)| k == "onclick" && v == "kept")
+                    })
+                })
+                .count()
+        };
+        assert_eq!(has_metadata(&doc), 2, "{attrs}");
+        let back = import(&export(&doc, &ExportOptions::default())).unwrap();
+        assert_eq!(has_metadata(&back), 2, "round trip: {attrs}");
+    }
+}
+
+#[test]
+fn metadata_id_styles_keep_the_original_cascade_and_structure() {
+    for body in [
+        r#"<style>circle[id] {fill:red} .dot {fill:blue} circle {fill:green}</style><circle class="dot" data-foo="kept" cx="40" cy="50" r="20"/>"#,
+        r#"<style>circle[id] {fill:red} circle {fill:blue}</style><style>circle {fill:green}</style><circle data-foo="kept" cx="40" cy="50" r="20"/>"#,
+        r#"<style>circle[id] {fill:red} circle {fill:blue!important}</style><circle style="fill:green" data-foo="kept" cx="40" cy="50" r="20"/>"#,
+        r#"<style>circle[id] {fill:red} circle {fill:blue!important}</style><circle style="fill:green!important" data-foo="kept" cx="40" cy="50" r="20"/>"#,
+        r#"<style>circle[id] {fill:red} g {fill:blue} circle + ellipse {fill:green}</style><g><circle data-foo="kept" cx="40" cy="50" r="20"/><ellipse cx="100" cy="50" rx="20" ry="10"/></g>"#,
+        r#"<style>circle[id] {fill:red} circle:first-child {fill:blue}</style><g><circle data-foo="kept" cx="40" cy="50" r="20"/><circle cx="100" cy="50" r="20"/></g>"#,
+        r#"<style>circle[id] {fill:red} #existing {fill:blue}</style><circle id="existing" data-foo="kept" cx="40" cy="50" r="20"/>"#,
+    ] {
+        let source = svg(body);
+        let actual = render_artboard(&import(&source).unwrap());
+        let expected = resvg_render(&source, 200, 120);
+        for (x, y) in [(40, 50), (100, 50)] {
+            let at = 4 * (y * actual.width + x) as usize;
+            assert_eq!(&actual.rgba[at..at + 4], &expected.rgba[at..at + 4], "{body}: ({x}, {y})");
+        }
+    }
+}
+
 /// All non-layer nodes in paint order.
 fn art(d: &Document) -> Vec<&Node> {
     let mut v = Vec::new();
@@ -42,7 +111,9 @@ fn resvg_render(svg: &str, w: u32, h: u32) -> Image {
 
 /// The effects of the only object.
 fn effects(d: &Document) -> Vec<Effect> {
-    let a = art(d);
+    // Not the clip group a filter's region may put it in (SVG 1.1 §15.5), nor its clipping path.
+    let a: Vec<&Node> =
+        art(d).into_iter().filter(|n| !matches!(n.kind, NodeKind::Group { clip: true, .. } | NodeKind::Path { clipping: true, .. })).collect();
     assert_eq!(a.len(), 1, "{a:?}");
     a[0].appearance.effects.clone()
 }
@@ -170,7 +241,7 @@ fn a_figma_blurred_shape_filter_becomes_gaussian_blur() {
     assert!(w.is_empty(), "{w:?}");
     let fx = effects(&d);
     assert_eq!(fx.len(), 1);
-    assert_eq!((fx[0].id.as_str(), &fx[0].params), ("blur.gaussian", &json!({"radius": 6.0})));
+    assert_eq!((fx[0].id.as_str(), &fx[0].params), ("blur.gaussian", &json!({"radius": 6.0, "linear": true})));
 }
 
 #[test]
@@ -205,12 +276,104 @@ fn a_gaussian_blur_becomes_the_effect_with_its_radius() {
     assert!(w.is_empty(), "{w:?}");
     let fx = effects(&d);
     assert_eq!(fx.len(), 1);
-    assert_eq!((fx[0].id.as_str(), &fx[0].params), ("blur.gaussian", &json!({"radius": 6.0})));
+    assert_eq!((fx[0].id.as_str(), &fx[0].params), ("blur.gaussian", &json!({"radius": 6.0, "linear": true})));
     // In a scaled group, the radius scales too.
     let (d, _) = open(
         r##"<defs><filter id="b"><feGaussianBlur stdDeviation="3"/></filter></defs><g transform="scale(2)"><rect width="30" height="20" filter="url(#b)"/></g>"##,
     );
     assert_eq!(effects(&d)[0].params["radius"], json!(12.0));
+}
+
+/// `color-interpolation-filters` (SVG 1.1 §15.7.6, initially linearRGB:
+/// https://www.w3.org/TR/SVG11/painting.html#ColorInterpolationFiltersProperty) picks whether the
+/// blur mixes colours in linear light; sRGB, on the primitive or the filter, keeps them as they
+/// are (#5877).
+#[test]
+fn a_gaussian_blur_keeps_its_colour_space() {
+    let blur = |filter: &str, primitive: &str| {
+        let (d, w) = open(&format!(
+            r##"<defs><filter id="b"{filter}><feGaussianBlur stdDeviation="10"{primitive}/></filter></defs><rect width="100" height="200" filter="url(#b)"/>"##
+        ));
+        assert!(w.is_empty(), "{w:?}");
+        effects(&d)[0].params.clone()
+    };
+    let linear = json!({"radius": 20.0, "linear": true});
+    let srgb = json!({"radius": 20.0});
+    assert_eq!(blur("", r#" color-interpolation-filters="linearRGB""#), linear);
+    assert_eq!(blur("", ""), linear, "linearRGB is the initial value");
+    assert_eq!(blur("", r#" color-interpolation-filters="sRGB""#), srgb);
+    assert_eq!(blur(r#" color-interpolation-filters="sRGB""#, ""), srgb, "inherited from the filter");
+    // Export writes the space back on the blur, so it survives a round trip.
+    let (d, _) =
+        open(r##"<defs><filter id="b"><feGaussianBlur stdDeviation="10"/></filter></defs><rect width="100" height="200" filter="url(#b)"/>"##);
+    let svg = export(&d, &ExportOptions::default());
+    assert!(svg.contains(r#"color-interpolation-filters="linearRGB"/>"#), "{svg}");
+    assert_eq!(effects(&import(&svg).unwrap())[0].params, linear);
+    // Drawn, black beside white meets as resvg (which blurs in either space) draws it.
+    for space in ["linearRGB", "sRGB"] {
+        let source = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><defs><filter id="f" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="10" color-interpolation-filters="{space}"/></filter></defs><g filter="url(#f)"><rect width="100" height="200"/><rect x="100" width="100" height="200" fill="white"/></g></svg>"##
+        );
+        let (ours, theirs) = (render_artboard(&import(&source).unwrap()), resvg_render(&source, 200, 200));
+        for x in [95, 99, 100, 105] {
+            let at = 4 * (100 * 200 + x) as usize;
+            assert!(ours.rgba[at].abs_diff(theirs.rgba[at]) <= 6, "{space} at {x}: {} vs {}", ours.rgba[at], theirs.rgba[at]);
+        }
+    }
+}
+
+/// The colour of pixel (`x`, `y`) of `svg` imported and drawn on white.
+fn drawn_at(svg: &str, x: u32, y: u32) -> [u8; 4] {
+    let img = render_artboard(&import(svg).unwrap());
+    let at = 4 * (y * img.width + x) as usize;
+    [img.rgba[at], img.rgba[at + 1], img.rgba[at + 2], img.rgba[at + 3]]
+}
+
+/// SVG 1.1 §15.5 (https://www.w3.org/TR/SVG11/filters.html#FilterEffectsRegion): a filter's
+/// result is cut at its region, so a blurred square shows only inside it (#5876). A region that
+/// holds the whole blur adds no clip.
+#[test]
+fn a_blur_is_cut_at_its_filter_region() {
+    let doc = |width: u32| {
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><defs><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="{width}" height="200"><feGaussianBlur stdDeviation="5"/></filter></defs><rect width="200" height="200" fill="red" filter="url(#f)"/></svg>"##
+        )
+    };
+    let red = |p: [u8; 4]| p[0] > 240 && p[1] < 30 && p[2] < 30;
+    assert!(red(drawn_at(&doc(50), 25, 100)));
+    assert_eq!(drawn_at(&doc(50), 100, 100), [255, 255, 255, 255], "outside the region");
+    assert!(red(drawn_at(&doc(200), 100, 100)));
+    // With room for the blur all round, the object is as before: no clip group.
+    let roomy = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><defs><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="200" height="200"><feGaussianBlur stdDeviation="2"/></filter></defs><rect x="50" y="50" width="100" height="100" fill="red" filter="url(#f)"/></svg>"##;
+    let d = import(roomy).unwrap();
+    assert_eq!(art(&d).len(), 1);
+    // Our own export sizes the region to the blur: it comes back unclipped.
+    let back = import(&export(&d, &ExportOptions::default())).unwrap();
+    assert_eq!(art(&back).len(), 1);
+}
+
+/// SVG 1.1 §14.4 (https://www.w3.org/TR/SVG11/masking.html#MaskElement): a mask's art counts
+/// only inside the mask's region, in user space or the object's bounding box (#5875).
+#[test]
+fn a_mask_counts_only_inside_its_region() {
+    let doc = |region: &str| {
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><defs><mask id="m" {region}><rect width="200" height="200" fill="white"/></mask></defs><rect width="200" height="200" fill="red" mask="url(#m)"/></svg>"##
+        )
+    };
+    let red = [255, 0, 0, 255];
+    for region in
+        [r#"maskUnits="userSpaceOnUse" x="0" y="0" width="50" height="200""#, r#"maskUnits="objectBoundingBox" x="0" y="0" width="0.25" height="1""#]
+    {
+        assert_eq!(drawn_at(&doc(region), 25, 100), red, "{region}");
+        assert_eq!(drawn_at(&doc(region), 100, 100), [255, 255, 255, 255], "{region}");
+    }
+    let wide = doc(r#"maskUnits="userSpaceOnUse" x="0" y="0" width="200" height="200""#);
+    assert_eq!(drawn_at(&wide, 100, 100), red);
+    // The default region (-10% to 120% of the object) holds the art: the mask art is as before.
+    let d = import(&doc("")).unwrap();
+    let mask = art(&d)[0].extras().mask.clone().unwrap();
+    assert!(matches!(mask.art.kind, NodeKind::Path { .. }), "{:?}", mask.art.kind);
 }
 
 /// The one drop shadow of the only object: (dx, dy, blur, colour, opacity %).
@@ -248,12 +411,10 @@ fn drop_shadow_chains_become_drop_shadows() {
     }
 }
 
-/// The object blurred, moved and its colors scaled under it is a drop shadow with Darkness when
-/// the blur and the scale work on sRGB values, or when the scale is 0; otherwise, on linear RGB
-/// values (the SVG default), it is reported. A blur on linear values whose result goes unused
-/// does not count.
+/// A proportional RGB filter is not additive Darkness. A fully black shadow remains
+/// recognizable, while other proportional transforms are reported rather than misrepresented.
 #[test]
-fn a_darkened_copy_of_the_object_becomes_a_drop_shadow_with_darkness() {
+fn proportional_filters_are_not_misread_as_additive_darkness() {
     let chain = |space: &str, transfer: &str, slope: f64| {
         format!(
             r##"<defs><filter id="s"{space}><feGaussianBlur in="SourceGraphic" stdDeviation="3" color-interpolation-filters="linearRGB" result="unused"/><feGaussianBlur in="SourceGraphic" stdDeviation="2"/><feOffset dx="4" dy="5"/><feComponentTransfer result="p"{transfer}><feFuncR type="linear" slope="{slope}"/><feFuncG type="linear" slope="{slope}"/><feFuncB type="linear" slope="{slope}"/><feFuncA type="linear" slope="0.6"/></feComponentTransfer><feMerge><feMergeNode in="p"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><rect x="50" y="30" width="60" height="40" fill="#f00" filter="url(#s)"/>"##
@@ -261,7 +422,7 @@ fn a_darkened_copy_of_the_object_becomes_a_drop_shadow_with_darkness() {
     };
     let srgb = r#" color-interpolation-filters="sRGB""#;
     // The scale 0 makes black whatever values it works on.
-    for (space, slope, darkness) in [(srgb, 0.5, 50.0), ("", 0.0, 100.0)] {
+    for (space, slope, darkness) in [(srgb, 0.0, 100.0), ("", 0.0, 100.0)] {
         let (d, w) = open(&chain(space, "", slope));
         assert!(w.is_empty(), "{w:?}");
         let fx = effects(&d);
@@ -273,7 +434,7 @@ fn a_darkened_copy_of_the_object_becomes_a_drop_shadow_with_darkness() {
         assert_eq!((&p["x"], &p["y"], &p["blur"]), (&json!(4.0), &json!(5.0), &json!(4.0)));
     }
     // Scaled on linear values, or blurred on them before an sRGB scale.
-    for (space, transfer) in [("", ""), ("", srgb)] {
+    for (space, transfer) in [(srgb, ""), ("", ""), ("", srgb)] {
         let (d, w) = open(&chain(space, transfer, 0.5));
         assert!(w.iter().any(|w| w.contains("filter")), "{transfer}: {w:?}");
         assert!(effects(&d).is_empty());
@@ -332,18 +493,18 @@ fn a_drop_shadow_with_darkness_exports_as_the_canvas_draws_it() {
     let mut n = Node::path(
         d.alloc_id(),
         shapes::rectangle(Rect::new(40.0, 20.0, 100.0, 70.0)),
-        Appearance::basic(Paint::solid(Color::rgb(1.0, 0.0, 0.0)), Paint::None, 0.0),
+        Appearance::basic(Paint::solid(Color::rgb(0.8, 0.4, 0.2)), Paint::None, 0.0),
     );
-    let shadow = json!({"x": 30.0, "y": 30.0, "blur": 0.0, "opacity": 100.0, "mode": "normal", "shade": "darkness", "darkness": 50.0});
+    let shadow = json!({"x": 30.0, "y": 30.0, "blur": 0.0, "opacity": 100.0, "mode": "normal", "shade": "darkness", "darkness": 25.0});
     n.appearance.effects = vec![Effect { id: "stylize.dropShadow".into(), params: shadow, visible: true }];
     let l = d.layers[0].id;
     d.insert(Some(l), 0, n).unwrap();
     let svg = export(&d, &ExportOptions::default());
     let (canvas, exported) = (render_artboard(&d), resvg_render(&svg, 200, 120));
-    // Where only the shadow lies: the red at half its value.
+    // An intermediate color distinguishes subtraction from proportional darkening.
     for img in [&canvas, &exported] {
         let [r, g, b] = img.over_white(115, 90);
-        assert!(r.abs_diff(128) <= 2 && g <= 2 && b <= 2, "{:?}", [r, g, b]);
+        assert!(r.abs_diff(140) <= 2 && g.abs_diff(38) <= 2 && b <= 2, "{:?}", [r, g, b]);
     }
     assert_similar(&canvas, &exported, 40.0, 0.02);
 }
@@ -378,7 +539,7 @@ fn symbols_and_effects_export_import_export_is_stable() {
         shapes::ellipse(Rect::new(0.0, 0.0, 20.0, 20.0)),
         Appearance::basic(Paint::solid(Color::rgb8(200, 30, 30)), Paint::None, 0.0),
     );
-    d.symbols.push(vectorcraft_doc::Symbol { name: "Dot".into(), art: Arc::new(dot) });
+    d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Dot".into(), art: Arc::new(dot) });
     let l = d.layers[0].id;
     for x in [10.0, 60.0] {
         let id = d.alloc_id();
